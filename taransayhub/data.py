@@ -8,20 +8,11 @@ import requests
 
 LOGGER = logging.getLogger(__name__)
 
+# Ignored messages.
 STATUS_MESSAGES = ["Resetting RF"]
 
-NODES = {
-    6: {
-        "group": "dammfeld",
-        "device": "base",
-        "datacodes": ["h", "h", "h", "h"],
-        "scales": [0.001, 0.1, 0.1, 0.1],
-        "rounding": [3, 1, 1, 1],
-    }
-}
 
-
-def parse_data(data):
+def parse_data(data, nodes):
     data = data.strip()
 
     if data in STATUS_MESSAGES:
@@ -54,7 +45,7 @@ def parse_data(data):
     node = int(pieces[0])
 
     try:
-        node_data = NODES[node]
+        node_data = nodes[node]
     except KeyError:
         raise ValueError(f"unrecognised node: {node}")
 
@@ -122,9 +113,9 @@ def decode(datacode, frame):
     return result[0]
 
 
-def ingest_data(data, queue):
+def ingest_data(data, queue, nodes):
     try:
-        parsed_data = parse_data(data)
+        parsed_data = parse_data(data, nodes)
     except Exception as e:
         LOGGER.debug(f"Skipped invalid data packet '{data}': {e}")
     else:

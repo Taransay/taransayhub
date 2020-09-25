@@ -1,0 +1,11 @@
+[Unit]
+Description=Taransay Forwarder
+After=network.target
+
+[Service]
+ExecStart=python3 -m taransayhub --config-file=/home/pi/taransayhub/taransayhub.yaml -vvv
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

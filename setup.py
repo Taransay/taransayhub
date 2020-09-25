@@ -14,7 +14,12 @@ setup(
     packages=find_packages(),
     python_requires=">=3.7",
     setup_requires=["setuptools_scm"],
-    install_requires=["click == 7.1.2", "pyserial-asyncio == 0.4"],
+    install_requires=[
+        "click == 7.1.2",
+        "pyserial-asyncio == 0.4",
+        "pyyaml == 5.3.1",
+        "requests == 2.24.0",
+    ],
     extras_require={
         "dev": [
             "pytest",
@@ -27,6 +32,7 @@ setup(
             "flake8-bugbear",
         ]
     },
+    entry_points={"console_scripts": ["taransayhub = taransayhub.__main__:hub"]},
     license="GPL-3.0-or-later",
     classifiers=[
         "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",

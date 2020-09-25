@@ -1,0 +1,12 @@
+device_path: /dev/ttyAMA0
+baud_rate: 38400
+post_url: http://example.com/v1/data
+backup_dir: /path/to/taransayhub/crash-backups
+
+nodes:
+  1:
+    group: mygroup
+    device: mydevice
+    datacodes: [h, h, h, h]
+    scales: [0.001, 0.1, 0.1, 0.1]
+    rounding: [3, 1, 1, 1]

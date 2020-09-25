@@ -1,3 +1,4 @@
+import sys
 import signal
 from pathlib import Path
 import pickle
@@ -11,15 +12,14 @@ from .data import ingest_data, send_queue_data
 
 LOGGER = logging.getLogger(__name__)
 
-COM_PATH = "/dev/ttyAMA0"
-BAUD_RATE = 38400
-URL = "http://192.168.178.200:5000/v1/data"
-BACKUP_DIR = "/home/pi/taransayhub/crash-backups"
-
 
 class TaransayHub:
-    def __init__(self):
-        self.backup_dir = Path(BACKUP_DIR)
+    def __init__(self, nodes, device_path, baud_rate, post_url, backup_dir):
+        self.nodes = nodes
+        self.device_path = Path(device_path)
+        self.backup_dir = Path(backup_dir)
+        self.baud_rate = int(baud_rate)
+        self.post_url = str(post_url)
         self.queue = None
 
         self._load_queue()
@@ -36,9 +36,9 @@ class TaransayHub:
 
         # Create the serial reader stream.
         reader, _ = await serial_asyncio.open_serial_connection(
-            url=COM_PATH, baudrate=BAUD_RATE
+            url=str(self.device_path), baudrate=self.baud_rate
         )
-        LOGGER.info(f"Reader created at {COM_PATH} @ {BAUD_RATE} byte/s")
+        LOGGER.info(f"Reader created at {self.device_path} @ {self.baud_rate} byte/s")
 
         # Create the received message handler.
         received = self._reciever(reader)
@@ -64,16 +64,21 @@ class TaransayHub:
 
         https://docs.python.org/3.8/library/asyncio-eventloop.html#set-signal-handlers-for-sigint-and-sigterm
         """
-        LOGGER.info(f"Received signal {signame}: exiting")
+        LOGGER.info(f"Received {signame} signal")
         self._backup_queue()
+
+        LOGGER.debug("Stopping event loop")
         loop.stop()
+
+        LOGGER.info("Exiting")
+        sys.exit(0)
 
     async def _reciever(self, reader):
         while True:
             raw_msg = await reader.readline()
             msg = raw_msg.strip().decode()
             LOGGER.debug(f"Received message '{msg}'.")
-            ingest_data(msg, self.queue)
+            ingest_data(msg, self.queue, self.nodes)
 
     async def _worker(self, delay):
         while True:
@@ -82,7 +87,7 @@ class TaransayHub:
             await asyncio.sleep(delay)
 
             try:
-                send_queue_data(self.queue, URL)
+                send_queue_data(self.queue, self.post_url)
             except Exception as e:
                 LOGGER.error(f"Could not send data: {e}")
 
