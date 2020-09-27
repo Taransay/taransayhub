@@ -4,7 +4,7 @@ with open("README.md") as readme_file:
     README = readme_file.read()
 
 setup(
-    name="taransay-forwarder",
+    name="taransay-hub",
     description="Taransay Data Forwarder",
     long_description=README,
     author="Sean Leavey",
