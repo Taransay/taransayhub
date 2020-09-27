@@ -1,6 +1,8 @@
 """Data decoding and parsing."""
 
 from datetime import datetime
+import json
+import zlib
 import struct
 from collections import defaultdict
 import logging
@@ -8,14 +10,16 @@ import requests
 
 LOGGER = logging.getLogger(__name__)
 
-# Ignored messages.
-STATUS_MESSAGES = ["Resetting RF"]
-
 
 def parse_data(data, nodes):
     data = data.strip()
 
-    if data in STATUS_MESSAGES:
+    if data.startswith("?"):
+        raise ValueError("unreliable content")
+    elif data.startswith(";"):
+        # Data is a comment.
+        comment = data.lstrip("; ")
+        LOGGER.info(f"[device] {comment}")
         return
 
     pieces = data.split()
@@ -23,9 +27,7 @@ def parse_data(data, nodes):
     if not pieces:
         return
 
-    if pieces[0] == "?":
-        raise ValueError("unreliable content")
-    elif pieces[0] != "OK":
+    if pieces[0] != "OK":
         raise ValueError("unexpected packet format")
 
     pieces = pieces[1:]
@@ -34,8 +36,10 @@ def parse_data(data, nodes):
         # The data was just an OK...
         return
 
-    # Remove RSSI.
+    # Report and remove received signal strength indicator (RSSI).
     if pieces[-1].startswith("(") and pieces[-1].endswith(")"):
+        rssi = pieces[-1].lstrip("(").rstrip(")")
+        LOGGER.debug(f"RSSI: {rssi} dB")
         pieces = pieces[:-1]
 
     if not pieces:
@@ -47,7 +51,9 @@ def parse_data(data, nodes):
     try:
         node_data = nodes[node]
     except KeyError:
-        raise ValueError(f"unrecognised node: {node}")
+        raise ValueError(
+            f"unrecognised node: {node} (ensure you have properly configured new nodes)"
+        )
 
     # Discard if anything non-numerical is found.
     try:
@@ -123,7 +129,7 @@ def ingest_data(data, queue, nodes):
             # Non-data packet.
             LOGGER.debug(f"Skipped non-data packet '{data}'")
         else:
-            queue.append((datetime.now(), parsed_data))
+            queue.append((datetime.utcnow(), parsed_data))
 
 
 def get_data_payload(items):
@@ -133,17 +139,42 @@ def get_data_payload(items):
         row = [str(data_time), parsed_data["data"]]
         payloads[parsed_data["group"]][parsed_data["device"]].append(row)
 
-    return {"sent": str(datetime.now()), "data": payloads}
+    return {"sent": str(datetime.utcnow()), "data": payloads}
 
 
-def send_queue_data(queue, url):
+def send_queue_data(queue, url, compress=True):
     LOGGER.debug(f"Posting payload to {url}")
 
     with QueueItemTransaction(queue) as items:
+        if not items:
+            LOGGER.debug("No data to send")
+            return
+
         LOGGER.debug(f"Sending request with {len(items)} item(s)")
         payload = get_data_payload(items)
-        response = requests.post(url, json=payload)
+
+        data = json.dumps(payload).encode("utf-8")
+
+        # Default request headers.
+        headers = {"Content-Type": "application/json; charset=utf-8"}
+
+        if compress:
+            compressed_data = zlib.compress(data)
+            factor = 1 - len(compressed_data) / len(data)
+
+            if factor > 1:
+                # Don't gzip after all because the packet is larger than uncompressed.
+                LOGGER.debug(f"Compressed data makes no saving so sending uncompressed")
+            else:
+                LOGGER.debug(f"Data was compressed with {100*factor:.2f}% saving")
+                data = compressed_data
+                headers["Content-Encoding"] = "gzip"
+
+        response = requests.post(url, data=data, headers=headers)
         LOGGER.debug(f"Got response: {response}")
+
+        # Raise exception if there was an error.
+        response.raise_for_status()
 
 
 class QueueItemTransaction:
