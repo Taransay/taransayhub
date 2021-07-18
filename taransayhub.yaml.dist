@@ -1,15 +1,42 @@
 device_path: /dev/ttyAMA0
 baud_rate: 38400
-post_url: http://example.com/v1/data
-post_period: 300
-post_max_fail_backoff: 4
-post_data_compress: true
-backup_path: /path/to/taransayhub/backup/file.dat
+discovery_prefix: homeassistant
 
 nodes:
   1:
-    group: mygroup
-    device: mydevice
-    datacodes: [h, h, h, h]
-    scales: [0.001, 0.1, 0.1, 0.1]
-    rounding: [3, 1, 1, 1]
+    name: base_station
+    device_type: base
+    expire_after: 300
+    channels:
+      battery_voltage:
+        enabled: true
+        description: Taransay base battery voltage
+        unit: V
+        class: voltage
+        code: h
+        scale: 0.001
+        precision: 3
+      temperature:
+        enabled: true
+        description: Taransay base temperature
+        unit: °C
+        class: temperature
+        code: h
+        scale: 0.1
+        precision: 1
+      humidity:
+        enabled: true
+        description: Taransay base humidity
+        unit: "%"
+        class: humidity
+        code: h
+        scale: 0.1
+        precision: 1
+      ext_temperature:
+        enabled: true
+        description: Taransay base external temperature
+        unit: °C
+        class: temperature
+        code: h
+        scale: 0.1
+        precision: 1

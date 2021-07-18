@@ -2,17 +2,23 @@
 
 import sys
 import signal
-from pathlib import Path
-import pickle
-from collections import deque
-import asyncio
-from functools import partial
 import logging
+from pathlib import Path
+from functools import partial
+import asyncio
+from enum import auto, Enum
+import json
 import yaml
 import serial_asyncio
-from .data import ingest_data, send_queue_data
+import paho.mqtt.publish as mqtt_publish
+from .data import ingest_data
 
 LOGGER = logging.getLogger(__name__)
+
+
+class TaransayTopicType(Enum):
+    STATE = auto()
+    CONFIG = auto()
 
 
 class TaransayHub:
@@ -24,16 +30,13 @@ class TaransayHub:
     """
 
     def __init__(self, config_file):
-        self._config_file = Path(config_file)
-        self.nodes = None
         self.device_path = None
-        self.backup_path = None
         self.baud_rate = None
-        self.post_url = None
-        self.queue = None
+        self.nodes = None
+        self.discovery_prefix = None
 
+        self._config_file = Path(config_file)
         self._load_config()
-        self._load_queue()
 
     def _load_config(self):
         LOGGER.debug(f"Loading configuration from {self._config_file}")
@@ -41,14 +44,10 @@ class TaransayHub:
         with self._config_file.open("r") as fobj:
             config_data = yaml.safe_load(fobj)
 
-        self.nodes = config_data["nodes"]
         self.device_path = Path(config_data["device_path"])
-        self.backup_path = Path(config_data["backup_path"])
         self.baud_rate = int(config_data["baud_rate"])
-        self.post_url = str(config_data["post_url"])
-        self.post_period = int(config_data["post_period"])
-        self.post_max_fail_backoff = int(config_data["post_max_fail_backoff"])
-        self.post_data_compress = bool(config_data["post_data_compress"])
+        self.discovery_prefix = config_data["discovery_prefix"]
+        self.nodes = config_data["nodes"]
 
     async def main(self):
         LOGGER.info(f"Starting {self.__class__.__name__}")
@@ -66,6 +65,9 @@ class TaransayHub:
             signal.SIGHUP, partial(self._handle_reload, signame, loop)
         )
 
+        LOGGER.info("Publishing autodiscover topics")
+        self._publish_autodiscover()
+
         # Create the serial reader stream.
         reader, _ = await serial_asyncio.open_serial_connection(
             url=str(self.device_path), baudrate=self.baud_rate
@@ -74,20 +76,16 @@ class TaransayHub:
 
         # Create the received message handler.
         received = self._reciever(reader)
-        # Create the queue worker.
-        worked = self._worker()
 
         # Wait until the callables finish, or an exception is thrown.
         finished, pending = await asyncio.wait(
-            [received, worked], return_when=asyncio.FIRST_EXCEPTION
+            [received], return_when=asyncio.FIRST_EXCEPTION
         )
 
         # Report any thrown exceptions.
         for task in finished:
             if task.exception():
                 LOGGER.error(f"{task} got an exception: {task.exception()}")
-
-        self._backup_queue()
 
         LOGGER.info("Finished")
 
@@ -96,12 +94,13 @@ class TaransayHub:
 
         https://docs.python.org/3.8/library/asyncio-eventloop.html#set-signal-handlers-for-sigint-and-sigterm
         """
-        LOGGER.info(f"Received {signame} signal")
-        self._backup_queue()
+        LOGGER.info(f"Received {signame} signal.")
+
+        LOGGER.info("Unpublishing autodiscover topics")
+        self._unpublish_autodiscover()
 
         LOGGER.debug("Stopping event loop")
         loop.stop()
-
         LOGGER.info("Exiting")
         sys.exit(0)
 
@@ -117,61 +116,109 @@ class TaransayHub:
         )
         self._load_config()
 
+        LOGGER.info("Republishing autodiscover topics")
+        self._publish_autodiscover()
+
     async def _reciever(self, reader):
         while True:
             raw_msg = await reader.readline()
-            msg = raw_msg.strip().decode()
-            LOGGER.debug(f"Received message '{msg}'.")
-            ingest_data(msg, self.queue, self.nodes)
-
-    async def _worker(self):
-        """Post data to remote server.
-
-        Uses exponential back-off on failures.
-        """
-        nfails = 0
-
-        while True:
-            # Wait for a while.
-            delay = 2 ** min(nfails, self.post_max_fail_backoff) * self.post_period
-            LOGGER.debug(f"Worker sleeping for {delay} s")
-            await asyncio.sleep(delay)
 
             try:
-                send_queue_data(
-                    self.queue, self.post_url, compress=self.post_data_compress
-                )
-            except Exception as e:
-                nfails += 1
-                LOGGER.error(f"Could not send data (subsequent failure {nfails}): {e}")
+                msg = raw_msg.strip().decode()
+            except UnicodeDecodeError as e:
+                LOGGER.error(f"Error decoding message: {e}")
             else:
-                # Reset the number of subsequent failures.
-                nfails = 0
+                LOGGER.debug(f"Received message '{msg}'.")
+                self._publish_recv_msg_to_mqtt(msg)
 
-            LOGGER.debug("Finished processing messages")
+    def _publish_autodiscover(self):
+        """Publish MQTT discovery topics for the nodes registered in the configuration."""
+        for node, nodeconfig in self.nodes.items():
+            msgs = []
+            device_name = nodeconfig["name"]
 
-    def _load_queue(self):
-        if self.backup_path.is_file():
-            LOGGER.info(f"Using saved backup at {self.backup_path}")
+            for channel_name, channel_data in nodeconfig["channels"].items():
+                payload = {
+                    "name": channel_data["description"],
+                    "device_class": channel_data["class"],
+                    "state_class": "measurement",
+                    "state_topic": self._state_topic(device_name),
+                    "unit_of_measurement": channel_data["unit"],
+                    "value_template": f"{{{{ value_json.data.{channel_name} }}}}",
+                    "expire_after": nodeconfig["expire_after"],
+                    "force_update": True,
+                }
 
-            with self.backup_path.open("rb") as fobj:
-                self.queue = pickle.load(fobj)
+                msg = {
+                    "topic": self._config_topic(device_name, channel_name),
+                    "payload": json.dumps(payload),
+                    "retain": True,
+                }
 
-            LOGGER.debug(f"Loaded {len(self.queue)} saved item(s)")
-        else:
-            # No backup file available.
-            self.queue = deque([])
+                msgs.append(msg)
 
-    def _backup_queue(self):
-        if not self.queue:
-            # Empty queue.
+            self._do_publish_multiple_mqtt(msgs, node)
+
+    def _unpublish_autodiscover(self):
+        """Unpublish MQTT discovery topics for the nodes registered in the configuration."""
+        for node, node_config in self.nodes.items():
+            msgs = []
+            device_name = node_config["name"]
+
+            for channel_name in node_config["channels"]:
+                msgs.append(
+                    {
+                        "topic": self._config_topic(device_name, channel_name),
+                        "payload": "",
+                    }
+                )
+
+            self._do_publish_multiple_mqtt(msgs, node)
+
+    def _publish_recv_msg_to_mqtt(self, msg):
+        data = ingest_data(msg, self.nodes)
+
+        if data is None:
+            LOGGER.info("Skipped invalid message.")
             return
 
-        # Create the path if not present.
-        self.backup_path.parent.mkdir(exist_ok=True)
-
-        LOGGER.info(
-            f"Dumping queue with {len(self.queue)} item(s) to {self.backup_path}"
+        tick, parsed_data = data
+        payload = {"datetime": str(tick), **parsed_data}
+        self._do_publish_single_mqtt(
+            self._state_topic(parsed_data["device_name"]),
+            json.dumps(payload),
+            parsed_data["node"],
         )
-        with self.backup_path.open("wb") as fobj:
-            pickle.dump(self.queue, fobj)
+
+    def _do_publish_single_mqtt(self, topic, payload, node, retain=True, **kwargs):
+        self._do_publish_multiple_mqtt(
+            [{"topic": topic, "payload": payload, "retain": retain}], node, **kwargs
+        )
+
+    def _do_publish_multiple_mqtt(self, msgs, node, **kwargs):
+        for msg in msgs:
+            LOGGER.debug(f"publishing message {msg}")
+
+        mqtt_publish.multiple(msgs, client_id=f"taransay-{node}", **kwargs)
+
+    def _state_topic(self, object_id):
+        return self._topic(object_id, type_=TaransayTopicType.STATE)
+
+    def _config_topic(self, device_name, channel_name):
+        return self._topic(
+            f"{device_name}_{channel_name}", type_=TaransayTopicType.CONFIG
+        )
+
+    def _topic(self, object_id, type_):
+        pieces = [self.discovery_prefix, "sensor", object_id]
+
+        if type_ is TaransayTopicType.STATE:
+            last = "state"
+        elif type_ is TaransayTopicType.CONFIG:
+            last = "config"
+        else:
+            raise ValueError(f"unknown topic type {repr(type_)}")
+
+        pieces.append(last)
+
+        return "/".join(pieces)

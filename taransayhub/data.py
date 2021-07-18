@@ -1,12 +1,8 @@
 """Data decoding and parsing."""
 
 from datetime import datetime
-import json
-import zlib
 import struct
-from collections import defaultdict
 import logging
-import requests
 
 LOGGER = logging.getLogger(__name__)
 
@@ -62,7 +58,8 @@ def parse_data(data, nodes):
         e.message = f"cannot handle non-float data ({e})"
         raise e
 
-    datacodes = node_data["datacodes"]
+    channel_spec = node_data["channels"]
+    datacodes = [channel["code"] for channel in channel_spec.values()]
     datasizes = [check_datacode(code) for code in datacodes]
 
     if len(raw_data) != sum(datasizes):
@@ -70,10 +67,10 @@ def parse_data(data, nodes):
             f"Received data length {len(raw_data)} is not valid for datacodes {datacodes}"
         )
 
-    decoded_data = []
+    decoded_data = {}
     byte_position = 0
 
-    for datacode in datacodes:
+    for (channel, channel_spec), datacode in zip(channel_spec.items(), datacodes):
         # Determine the number of bytes to use for each value by its datacode.
         size = int(check_datacode(datacode))
         # Decode the data.
@@ -81,19 +78,21 @@ def parse_data(data, nodes):
             datacode, [int(v) for v in raw_data[byte_position : byte_position + size]]
         )
         byte_position += size
-        decoded_data.append(value)
+        value = round(value * channel_spec["scale"], channel_spec["precision"])
 
-    scales = node_data["scales"]
-    scaled_data = [value * scale for value, scale in zip(decoded_data, scales)]
-    rounded_data = [
-        round(value, precision)
-        for value, precision in zip(scaled_data, node_data["rounding"])
-    ]
+        if not channel_spec["enabled"]:
+            LOGGER.debug(
+                f"skipping disabled channel {repr(channel)} with value {repr(value)}"
+            )
+            continue
+
+        decoded_data[channel] = value
 
     return {
-        "group": node_data["group"],
-        "device": node_data["device"],
-        "data": rounded_data,
+        "node": node,
+        "device_name": node_data["name"],
+        "device_type": node_data["device_type"],
+        "data": decoded_data,
     }
 
 
@@ -119,88 +118,14 @@ def decode(datacode, frame):
     return result[0]
 
 
-def ingest_data(data, queue, nodes):
+def ingest_data(data, nodes):
     try:
         parsed_data = parse_data(data, nodes)
     except Exception as e:
-        LOGGER.debug(f"Skipped invalid data packet '{data}': {e}")
+        LOGGER.debug(f"Skipped invalid data packet '{data}' ({type(e)}): {e}")
     else:
         if parsed_data is None:
             # Non-data packet.
             LOGGER.debug(f"Skipped non-data packet '{data}'")
         else:
-            queue.append((datetime.utcnow(), parsed_data))
-
-
-def get_data_payload(items):
-    payloads = defaultdict(lambda: defaultdict(list))
-
-    for data_time, parsed_data in items:
-        row = [str(data_time), parsed_data["data"]]
-        payloads[parsed_data["group"]][parsed_data["device"]].append(row)
-
-    return {"sent": str(datetime.utcnow()), "data": payloads}
-
-
-def send_queue_data(queue, url, compress=True):
-    LOGGER.debug(f"Posting payload to {url}")
-
-    with QueueItemTransaction(queue) as items:
-        if not items:
-            LOGGER.debug("No data to send")
-            return
-
-        LOGGER.debug(f"Sending request with {len(items)} item(s)")
-        payload = get_data_payload(items)
-
-        data = json.dumps(payload).encode("utf-8")
-
-        # Default request headers.
-        headers = {"Content-Type": "application/json; charset=utf-8"}
-
-        if compress:
-            compressed_data = zlib.compress(data)
-            factor = 1 - len(compressed_data) / len(data)
-
-            if factor > 1:
-                # Don't gzip after all because the packet is larger than uncompressed.
-                LOGGER.debug(f"Compressed data makes no saving so sending uncompressed")
-            else:
-                LOGGER.debug(f"Data was compressed with {100*factor:.2f}% saving")
-                data = compressed_data
-                headers["Content-Encoding"] = "gzip"
-
-        response = requests.post(url, data=data, headers=headers)
-        LOGGER.debug(f"Got response: {response}")
-
-        # Raise exception if there was an error.
-        response.raise_for_status()
-
-
-class QueueItemTransaction:
-    def __init__(self, queue):
-        self._queue = queue
-        self._transaction_items = []
-
-    def __enter__(self):
-        while True:
-            try:
-                self._transaction_items.append(self._queue.popleft())
-            except IndexError:
-                # Queue is empty.
-                break
-
-        return self._transaction_items
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        if exc_type is None:
-            # Nothing went wrong.
-            return
-
-        LOGGER.warning(f"Queue item transaction did not succeed; restoring items")
-
-        # Restore the items.
-        for item in reversed(self._transaction_items):
-            self._queue.appendleft(item)
-
-        LOGGER.info(f"Put {len(self._transaction_items)} item(s) back into queue")
+            return datetime.utcnow(), parsed_data

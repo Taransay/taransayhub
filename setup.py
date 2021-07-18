@@ -15,10 +15,10 @@ setup(
     python_requires=">=3.7",
     setup_requires=["setuptools_scm"],
     install_requires=[
-        "click == 7.1.2",
-        "pyserial-asyncio == 0.4",
-        "pyyaml == 5.3.1",
-        "requests == 2.24.0",
+        "click >= 7.1",
+        "pyserial-asyncio >= 0.4",
+        "pyyaml >= 5.3",
+        "paho-mqtt >= 1.5",
     ],
     extras_require={
         "dev": [
