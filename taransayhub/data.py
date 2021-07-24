@@ -67,7 +67,7 @@ def parse_data(data, nodes):
             f"Received data length {len(raw_data)} is not valid for datacodes {datacodes}"
         )
 
-    decoded_data = {}
+    decoded_data = {"rssi": rssi}
     byte_position = 0
 
     for (channel, channel_spec), datacode in zip(channel_spec.items(), datacodes):

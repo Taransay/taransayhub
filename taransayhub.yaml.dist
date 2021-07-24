@@ -5,8 +5,12 @@ discovery_prefix: homeassistant
 nodes:
   1:
     name: base_station
+    description: Base Station
     device_type: base
+    board_model: Taransay r1
+    firmware_version: "1.0.0"
     expire_after: 300
+    rssi: false
     channels:
       battery_voltage:
         enabled: true

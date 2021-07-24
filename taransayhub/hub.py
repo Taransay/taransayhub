@@ -3,6 +3,7 @@
 import sys
 import signal
 import logging
+from collections import defaultdict
 from pathlib import Path
 from functools import partial
 import asyncio
@@ -37,6 +38,7 @@ class TaransayHub:
 
         self._config_file = Path(config_file)
         self._load_config()
+        self._configured_topics = defaultdict(list)
 
     def _load_config(self):
         LOGGER.debug(f"Loading configuration from {self._config_file}")
@@ -133,46 +135,95 @@ class TaransayHub:
 
     def _publish_autodiscover(self):
         """Publish MQTT discovery topics for the nodes registered in the configuration."""
+        def _spec_payload(
+            device_unique_id,
+            device_class,
+            device_spec,
+            channel_unique_id,
+            channel_name,
+            description,
+            unit,
+            expire_after
+        ):
+            payload = {
+                "unique_id": channel_unique_id,
+                "name": description,
+                "device_class": device_class,
+                # See https://developers.home-assistant.io/docs/device_registry_index/.
+                "device": device_spec,
+                "state_class": "measurement",
+                "state_topic": self._state_topic(device_unique_id),
+                "unit_of_measurement": unit,
+                "value_template": f"{{{{ value_json.data.{channel_name} }}}}",
+                "expire_after": expire_after,
+            }
+
+            msg = {
+                "topic": self._config_topic(channel_unique_id),
+                "payload": json.dumps(payload),
+                "retain": True,
+            }
+
+            return msg
+
         for node, nodeconfig in self.nodes.items():
             msgs = []
             device_name = nodeconfig["name"]
+            device_unique_id = self._device_unique_id(device_name)
 
+            # See https://developers.home-assistant.io/docs/device_registry_index/.
+            device_spec = {
+                "identifiers": [f"taransay-{node}"],
+                "manufacturer": "Sean Leavey",
+                "model": nodeconfig["board_model"],
+                "name": nodeconfig["description"],
+                "sw_version": nodeconfig["firmware_version"],
+            }
+
+            # Set up channels in config.
             for channel_name, channel_data in nodeconfig["channels"].items():
-                payload = {
-                    "name": channel_data["description"],
-                    "device_class": channel_data["class"],
-                    "state_class": "measurement",
-                    "state_topic": self._state_topic(device_name),
-                    "unit_of_measurement": channel_data["unit"],
-                    "value_template": f"{{{{ value_json.data.{channel_name} }}}}",
-                    "expire_after": nodeconfig["expire_after"],
-                    "force_update": True,
-                }
+                if not channel_data["enabled"]:
+                    LOGGER.info(f"skipping ignored channel {repr(channel_name)} for node {node}")
+                    continue
 
-                msg = {
-                    "topic": self._config_topic(device_name, channel_name),
-                    "payload": json.dumps(payload),
-                    "retain": True,
-                }
-
+                channel_unique_id = self._channel_unique_id(device_name, channel_name)
+                msg = _spec_payload(
+                    device_unique_id=device_unique_id,
+                    device_class=channel_data["class"],
+                    device_spec=device_spec,
+                    channel_unique_id=channel_unique_id,
+                    channel_name=channel_name,
+                    description=channel_data["description"],
+                    unit=channel_data["unit"],
+                    expire_after=nodeconfig["expire_after"]
+                )
                 msgs.append(msg)
+                self._configured_topics[node].append(msg["topic"])
+
+            # Set up RSSI.
+            if nodeconfig["rssi"]:
+                channel_name = "rssi"
+                channel_unique_id = self._channel_unique_id(device_name, channel_name)
+                msg = _spec_payload(
+                    device_unique_id=device_unique_id,
+                    device_class="signal_strength",
+                    device_spec=device_spec,
+                    channel_unique_id=channel_unique_id,
+                    channel_name=channel_name,
+                    description=nodeconfig["rssi_description"],
+                    unit="dBm",
+                    expire_after=nodeconfig["expire_after"]
+                )
+                msgs.append(msg)
+                self._configured_topics[node].append(msg["topic"])
 
             self._do_publish_multiple_mqtt(msgs, node)
 
     def _unpublish_autodiscover(self):
         """Unpublish MQTT discovery topics for the nodes registered in the configuration."""
-        for node, node_config in self.nodes.items():
-            msgs = []
-            device_name = node_config["name"]
-
-            for channel_name in node_config["channels"]:
-                msgs.append(
-                    {
-                        "topic": self._config_topic(device_name, channel_name),
-                        "payload": "",
-                    }
-                )
-
+        while self._configured_topics:
+            node, topics = self._configured_topics.popitem()
+            msgs = [{"topic": topic, "payload": ""} for topic in topics]
             self._do_publish_multiple_mqtt(msgs, node)
 
     def _publish_recv_msg_to_mqtt(self, msg):
@@ -184,8 +235,9 @@ class TaransayHub:
 
         tick, parsed_data = data
         payload = {"datetime": str(tick), **parsed_data}
+        unique_id = self._device_unique_id(parsed_data["device_name"])
         self._do_publish_single_mqtt(
-            self._state_topic(parsed_data["device_name"]),
+            self._state_topic(unique_id),
             json.dumps(payload),
             parsed_data["node"],
         )
@@ -201,13 +253,17 @@ class TaransayHub:
 
         mqtt_publish.multiple(msgs, client_id=f"taransay-{node}", **kwargs)
 
-    def _state_topic(self, object_id):
-        return self._topic(object_id, type_=TaransayTopicType.STATE)
+    def _device_unique_id(self, device_name):
+        return f"taransay-{device_name}"
 
-    def _config_topic(self, device_name, channel_name):
-        return self._topic(
-            f"{device_name}_{channel_name}", type_=TaransayTopicType.CONFIG
-        )
+    def _channel_unique_id(self, device_name, channel_name):
+        return f"{self._device_unique_id(device_name)}-{channel_name}"
+
+    def _state_topic(self, unique_id):
+        return self._topic(unique_id, type_=TaransayTopicType.STATE)
+
+    def _config_topic(self, unique_id):
+        return self._topic(unique_id, type_=TaransayTopicType.CONFIG)
 
     def _topic(self, object_id, type_):
         pieces = [self.discovery_prefix, "sensor", object_id]
