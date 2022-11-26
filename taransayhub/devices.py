@@ -390,7 +390,9 @@ class TemperatureHumidityDevice(Device):
 
             payload = json.dumps(
                 {
+                    "unique_id": channel_unique_id,
                     "name": channel_data["description"],
+                    "device": self.device_spec,
                     "device_class": channel_data["class"],
                     "state_topic": self.state_topic,
                     "unit_of_measurement": channel_data["unit"],

@@ -16,7 +16,7 @@ nodes:
 
   25:
     name: th1
-    description: Environment sensor
+    description: Living room environment sensor
     device_type: th
     board: Taransay
     board_version: r1
@@ -24,32 +24,32 @@ nodes:
     firmware_version: "1.1.0"
     expire_after: 900
     rssi: true
-    rssi_description: Room received signal strength indicator
+    rssi_description: Living room received signal strength indicator
     channels:
       battery_voltage:
         enabled: true
-        description: Room battery voltage
+        description: Living room battery voltage
         unit: V
         class: voltage
         scale: 0.001
         precision: 3
       temperature:
         enabled: true
-        description: Room temperature
+        description: Living room temperature
         unit: °C
         class: temperature
         scale: 0.01
         precision: 2
       ext_temperature:
         enabled: true
-        description: Room external temperature
+        description: Living room external temperature
         unit: °C
         class: temperature
         scale: 0.1
         precision: 1
       humidity:
         enabled: true
-        description: Room humidity
+        description: Living room humidity
         unit: "%"
         class: humidity
         scale: 0.01
