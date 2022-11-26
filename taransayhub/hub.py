@@ -4,6 +4,7 @@ import sys
 import signal
 import logging
 from collections import defaultdict
+from contextlib import AsyncExitStack
 from pathlib import Path
 from functools import partial
 import asyncio
@@ -12,13 +13,17 @@ import json
 import yaml
 import serial_asyncio
 import paho.mqtt.publish as mqtt_publish
-from .data import ingest_data
+import paho.mqtt.subscribe as mqtt_subscribe
+from asyncio_mqtt import Client
+from . import devices
+from .data import parse_payload, TaransayDataType
 
 LOGGER = logging.getLogger(__name__)
 
 
 class TaransayTopicType(Enum):
     STATE = auto()
+    COMMAND = auto()
     CONFIG = auto()
 
 
@@ -30,15 +35,29 @@ class TaransayHub:
     queue and sends it to the configured remote server.
     """
 
+    DEVICES = {
+        "rgb": devices.RGBDevice,
+        "rgbw": devices.RGBWDevice,
+        "switch": devices.SwitchDevice,
+        "th": devices.TemperatureHumidityDevice,
+    }
+
     def __init__(self, config_file):
         self.device_path = None
         self.baud_rate = None
         self.nodes = None
         self.discovery_prefix = None
+        self.client_id = None
+        self.request_acknowledge = None
 
         self._config_file = Path(config_file)
         self._load_config()
-        self._configured_topics = defaultdict(list)
+
+        # State stuff.
+        self._client = None
+        self._tasks = None
+        self._devices = None  # node -> Device
+        self._serial_writer = None
 
     def _load_config(self):
         LOGGER.debug(f"Loading configuration from {self._config_file}")
@@ -46,6 +65,8 @@ class TaransayHub:
         with self._config_file.open("r") as fobj:
             config_data = yaml.safe_load(fobj)
 
+        self.client_id = config_data["client_id"]
+        self.request_acknowledge = config_data["request_acknowledge"]
         self.device_path = Path(config_data["device_path"])
         self.baud_rate = int(config_data["baud_rate"])
         self.discovery_prefix = config_data["discovery_prefix"]
@@ -54,227 +75,150 @@ class TaransayHub:
     async def main(self):
         LOGGER.info(f"Starting {self.__class__.__name__}")
 
-        loop = asyncio.get_running_loop()
-
-        # Set up kill signal handlers.
-        for signame in ("SIGINT", "SIGTERM"):
-            loop.add_signal_handler(
-                getattr(signal, signame), partial(self._handle_exit, signame, loop)
-            )
-
-        # Set up config reload handler.
-        loop.add_signal_handler(
-            signal.SIGHUP, partial(self._handle_reload, signame, loop)
-        )
-
-        LOGGER.info("Publishing autodiscover topics")
-        self._publish_autodiscover()
+        self._tasks = set()
+        self._devices = {}
 
         # Create the serial reader stream.
-        reader, _ = await serial_asyncio.open_serial_connection(
+        serial_reader, self._serial_writer = await serial_asyncio.open_serial_connection(
             url=str(self.device_path), baudrate=self.baud_rate
         )
-        LOGGER.info(f"Reader created at {self.device_path} @ {self.baud_rate} byte/s")
+        LOGGER.info(f"Serial reader created at {self.device_path} @ {self.baud_rate} byte/s")
 
-        # Create the received message handler.
-        received = self._reciever(reader)
+        LOGGER.info("Configuring devices")
+        self._configure_devices()
 
-        # Wait until the callables finish, or an exception is thrown.
-        finished, pending = await asyncio.wait(
-            [received], return_when=asyncio.FIRST_EXCEPTION
-        )
+        # Connect to the MQTT broker
+        self._client = Client("localhost", client_id=self.client_id)
 
-        # Report any thrown exceptions.
-        for task in finished:
-            if task.exception():
-                LOGGER.error(f"{task} got an exception: {task.exception()}")
+        async with AsyncExitStack() as stack:
+            await stack.enter_async_context(self._client)
 
+            # Keep track of the asyncio tasks that we create, so that we can cancel them on exit.
+            stack.push_async_callback(self._cancel, self._client)
+
+            for device in self._devices.values():
+                manager = device.mqtt_filter()
+                messages = await stack.enter_async_context(manager)
+                self._tasks.add(asyncio.create_task(device.handle_filtered_messages(messages)))
+
+                # Note that we subscribe *after* starting the message loggers. Otherwise, we may
+                # miss retained messages.
+                await device.mqtt_subscribe()
+                await device.mqtt_publish_discovery()
+
+            # Messages that doesn't match a filter will get logged here
+            #messages = await stack.enter_async_context(client.unfiltered_messages())
+            #task = asyncio.create_task(self._log_messages(messages, "[unfiltered] {}"))
+            #self._tasks.add(task)
+
+            # Setup serial message handler.
+            task = asyncio.create_task(self._serial_receiver(serial_reader))
+            self._tasks.add(task)
+
+            # Wait until the callables finish, or an exception is thrown.
+            finished, pending = await asyncio.wait(self._tasks, return_when=asyncio.FIRST_EXCEPTION)
+
+            # Report any thrown exceptions.
+            for task in finished:
+                if task.exception():
+                    LOGGER.error(f"{task} got an exception: {task.exception()}")
+
+        self._client = None
         LOGGER.info("Finished")
 
-    def _handle_exit(self, signame, loop):
-        """Handle a shutdown.
+    async def _log_messages(self, messages, template):
+        async for message in messages:
+            # 🤔 Note that we assume that the message payload is an
+            # UTF8-encoded string (hence the `bytes.decode` call).
+            print(template.format(message.payload.decode()))
 
-        https://docs.python.org/3.8/library/asyncio-eventloop.html#set-signal-handlers-for-sigint-and-sigterm
-        """
-        LOGGER.info(f"Received {signame} signal.")
+    async def _cancel(self, client):
+        for task in self._tasks:
+            if task.done():
+                continue
 
-        LOGGER.info("Unpublishing autodiscover topics")
-        self._unpublish_autodiscover()
+            task.cancel()
 
-        LOGGER.debug("Stopping event loop")
-        loop.stop()
-        LOGGER.info("Exiting")
-        sys.exit(0)
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
-    def _handle_reload(self, signame, loop):
-        """Handle a configuration reload.
+        LOGGER.info("Unconfiguring devices")
+        for device in self._devices.values():
+            await device.mqtt_unconfigure(client)
 
-        Note: if this interrupts a routine that is currently reading the configuration values, it could get
-        a mix of old and new configuration values.
-        """
-        LOGGER.info(f"Received {signame} signal")
-        LOGGER.debug(
-            "Note: device path and baud rate cannot be altered without restart"
-        )
-        self._load_config()
-
-        LOGGER.info("Republishing autodiscover topics")
-        self._publish_autodiscover()
-
-    async def _reciever(self, reader):
+    async def _serial_receiver(self, serial_reader):
         while True:
-            raw_msg = await reader.readline()
+            raw_msg = await serial_reader.readline()
 
             try:
                 msg = raw_msg.strip().decode()
             except UnicodeDecodeError as e:
                 LOGGER.error(f"Error decoding message: {e}")
             else:
-                LOGGER.debug(f"Received message '{msg}'.")
-                self._publish_recv_msg_to_mqtt(msg)
+                await self._handle_received_serial(msg)
 
-    def _publish_autodiscover(self):
-        """Publish MQTT discovery topics for the nodes registered in the configuration."""
-        def _spec_payload(
-            device_unique_id,
-            device_class,
-            device_spec,
-            channel_unique_id,
-            channel_name,
-            description,
-            unit,
-            expire_after
-        ):
-            payload = {
-                "unique_id": channel_unique_id,
-                "name": description,
-                "device_class": device_class,
-                # See https://developers.home-assistant.io/docs/device_registry_index/.
-                "device": device_spec,
-                "state_class": "measurement",
-                "state_topic": self._state_topic(device_unique_id),
-                "unit_of_measurement": unit,
-                "value_template": f"{{{{ value_json.data.{channel_name} }}}}",
-                "expire_after": expire_after,
-            }
+    def _configure_devices(self):
+        """Configure devices."""
+        for node, config in self.nodes.items():
+            devicetype = self.DEVICES[config.pop("device_type")]
+            name = config.pop("name")
 
-            msg = {
-                "topic": self._config_topic(channel_unique_id),
-                "payload": json.dumps(payload),
-                "retain": True,
-            }
+            device = devicetype(
+                name=name,
+                node=node,
+                discovery_prefix=self.discovery_prefix,
+                serial_write=partial(self._serial_write, node=node),
+                publish=partial(self._mqtt_device_publish, node=node),
+                subscribe=partial(self._mqtt_device_subscribe, node=node),
+                unsubscribe=partial(self._mqtt_device_unsubscribe, node=node),
+                filter=partial(self._mqtt_device_filter, node=node),
+                **config
+            )
+            self._devices[node] = device
 
-            return msg
+    async def _serial_write(self, message, node):
+        tx = "TXA" if self.request_acknowledge else "TX"
+        payload = f"{tx}:{node}:{message}\n"
+        LOGGER.info(f"Sending payload: {payload[:-1]}")
+        return self._serial_writer.write(payload.encode("ascii"))
 
-        for node, nodeconfig in self.nodes.items():
-            msgs = []
-            device_name = nodeconfig["name"]
-            device_unique_id = self._device_unique_id(device_name)
+    async def _mqtt_device_publish(self, *args, node, **kwargs):
+        LOGGER.debug(f"MQTT device publish args={args} node={node} kwargs={kwargs}")
+        await self._client.publish(*args, **kwargs)
 
-            # See https://developers.home-assistant.io/docs/device_registry_index/.
-            device_spec = {
-                "identifiers": [f"taransay-{node}"],
-                "manufacturer": "Sean Leavey",
-                "model": nodeconfig["board_model"],
-                "name": nodeconfig["description"],
-                "sw_version": nodeconfig["firmware_version"],
-            }
+    async def _mqtt_device_subscribe(self, *args, node, **kwargs):
+        LOGGER.debug(f"MQTT device subscribe args={args} node={node} kwargs={kwargs}")
+        await self._client.subscribe(*args, **kwargs)
 
-            # Set up channels in config.
-            for channel_name, channel_data in nodeconfig["channels"].items():
-                if not channel_data["enabled"]:
-                    LOGGER.info(f"skipping ignored channel {repr(channel_name)} for node {node}")
-                    continue
+    async def _mqtt_device_unsubscribe(self, *args, node, **kwargs):
+        LOGGER.debug(f"MQTT device unsubscribe args={args} node={node} kwargs={kwargs}")
+        await self._client.unsubscribe(*args, **kwargs)
 
-                channel_unique_id = self._channel_unique_id(device_name, channel_name)
-                msg = _spec_payload(
-                    device_unique_id=device_unique_id,
-                    device_class=channel_data["class"],
-                    device_spec=device_spec,
-                    channel_unique_id=channel_unique_id,
-                    channel_name=channel_name,
-                    description=channel_data["description"],
-                    unit=channel_data["unit"],
-                    expire_after=nodeconfig["expire_after"]
-                )
-                msgs.append(msg)
-                self._configured_topics[node].append(msg["topic"])
+    def _mqtt_device_filter(self, *args, node, **kwargs):
+        LOGGER.debug(f"MQTT device filter args={args} node={node} kwargs={kwargs}")
+        return self._client.filtered_messages(*args, **kwargs)
 
-            # Set up RSSI.
-            if nodeconfig["rssi"]:
-                channel_name = "rssi"
-                channel_unique_id = self._channel_unique_id(device_name, channel_name)
-                msg = _spec_payload(
-                    device_unique_id=device_unique_id,
-                    device_class="signal_strength",
-                    device_spec=device_spec,
-                    channel_unique_id=channel_unique_id,
-                    channel_name=channel_name,
-                    description=nodeconfig["rssi_description"],
-                    unit="dBm",
-                    expire_after=nodeconfig["expire_after"]
-                )
-                msgs.append(msg)
-                self._configured_topics[node].append(msg["topic"])
+    async def _handle_received_serial(self, msg):
+        msg_type, msg_data = parse_payload(msg)
 
-            self._do_publish_multiple_mqtt(msgs, node)
-
-    def _unpublish_autodiscover(self):
-        """Unpublish MQTT discovery topics for the nodes registered in the configuration."""
-        while self._configured_topics:
-            node, topics = self._configured_topics.popitem()
-            msgs = [{"topic": topic, "payload": ""} for topic in topics]
-            self._do_publish_multiple_mqtt(msgs, node)
-
-    def _publish_recv_msg_to_mqtt(self, msg):
-        data = ingest_data(msg, self.nodes)
-
-        if data is None:
-            LOGGER.info("Skipped invalid message.")
-            return
-
-        tick, parsed_data = data
-        payload = {"datetime": str(tick), **parsed_data}
-        unique_id = self._device_unique_id(parsed_data["device_name"])
-        self._do_publish_single_mqtt(
-            self._state_topic(unique_id),
-            json.dumps(payload),
-            parsed_data["node"],
-        )
-
-    def _do_publish_single_mqtt(self, topic, payload, node, retain=True, **kwargs):
-        self._do_publish_multiple_mqtt(
-            [{"topic": topic, "payload": payload, "retain": retain}], node, **kwargs
-        )
-
-    def _do_publish_multiple_mqtt(self, msgs, node, **kwargs):
-        for msg in msgs:
-            LOGGER.debug(f"publishing message {msg}")
-
-        mqtt_publish.multiple(msgs, client_id=f"taransay-{node}", **kwargs)
-
-    def _device_unique_id(self, device_name):
-        return f"taransay-{device_name}"
-
-    def _channel_unique_id(self, device_name, channel_name):
-        return f"{self._device_unique_id(device_name)}-{channel_name}"
-
-    def _state_topic(self, unique_id):
-        return self._topic(unique_id, type_=TaransayTopicType.STATE)
-
-    def _config_topic(self, unique_id):
-        return self._topic(unique_id, type_=TaransayTopicType.CONFIG)
-
-    def _topic(self, object_id, type_):
-        pieces = [self.discovery_prefix, "sensor", object_id]
-
-        if type_ is TaransayTopicType.STATE:
-            last = "state"
-        elif type_ is TaransayTopicType.CONFIG:
-            last = "config"
+        if msg_type is TaransayDataType.COMMENT:
+            LOGGER.debug(f"Comment from base: {msg_data}")
+        elif msg_type is TaransayDataType.PROMPT:
+            LOGGER.debug(f"Prompt from base: {msg_data}")
+        elif msg_type is TaransayDataType.ERROR:
+            LOGGER.error(f"Error from base: {msg_data}")
+        elif msg_type is TaransayDataType.UNRECOGNISED:
+            LOGGER.warning(f"Unrecognised message from base: {msg_data}")
         else:
-            raise ValueError(f"unknown topic type {repr(type_)}")
+            ack = "acknowledged" if msg_data.get("rssi") else "not acknowledged"
+            LOGGER.debug(f"Payload via base: {repr(msg_data)} ({ack})")
 
-        pieces.append(last)
+            node = int(msg_data["node"])
+            device = self._devices.get(node)
 
-        return "/".join(pieces)
+            if device is None:
+                LOGGER.error(f"Sending device {repr(node)} not configured")
+            else:
+                await device.handle_device_payload(msg_data)

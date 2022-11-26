@@ -1,5 +1,7 @@
-device_path: /dev/ttyAMA0
-baud_rate: 38400
+client_id: some-host
+request_acknowledge: true
+device_path: /dev/ttyS0
+baud_rate: 115200
 discovery_prefix: homeassistant
 
 nodes:
@@ -7,40 +9,48 @@ nodes:
     name: base_station
     description: Base Station
     device_type: base
-    board_model: Taransay r1
+    board: Taransay
+    board_version: r1
+    firmware: taransay_x
     firmware_version: "1.0.0"
-    expire_after: 300
-    rssi: false
+
+  25:
+    name: th1
+    description: Environment sensor
+    device_type: th
+    board: Taransay
+    board_version: r1
+    firmware: taransay_th
+    firmware_version: "1.1.0"
+    expire_after: 900
+    rssi: true
+    rssi_description: Room received signal strength indicator
     channels:
       battery_voltage:
         enabled: true
-        description: Taransay base battery voltage
+        description: Room battery voltage
         unit: V
         class: voltage
-        code: h
         scale: 0.001
         precision: 3
       temperature:
         enabled: true
-        description: Taransay base temperature
+        description: Room temperature
         unit: °C
         class: temperature
-        code: h
+        scale: 0.01
+        precision: 2
+      ext_temperature:
+        enabled: true
+        description: Room external temperature
+        unit: °C
+        class: temperature
         scale: 0.1
         precision: 1
       humidity:
         enabled: true
-        description: Taransay base humidity
+        description: Room humidity
         unit: "%"
         class: humidity
-        code: h
-        scale: 0.1
-        precision: 1
-      ext_temperature:
-        enabled: true
-        description: Taransay base external temperature
-        unit: °C
-        class: temperature
-        code: h
-        scale: 0.1
-        precision: 1
+        scale: 0.01
+        precision: 2
