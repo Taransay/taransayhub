@@ -429,9 +429,9 @@ class TemperatureHumidityDevice(Device):
             return
 
         def prepare(raw, channel):
-            scale = self.channels[channel]["scale"]
+            scale = float(self.channels[channel]["scale"])
             precision = self.channels[channel]["precision"]
-            return f"{raw * scale}.{precision}f"
+            return f"{float(raw) * scale:.{precision}f}"
 
         payload["data"] = {
             "battery_voltage": prepare(pieces[2], "battery_voltage"),
