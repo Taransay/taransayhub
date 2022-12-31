@@ -40,6 +40,7 @@ class TaransayHub:
         "rgbw": devices.RGBWDevice,
         "switch": devices.SwitchDevice,
         "th": devices.TemperatureHumidityDevice,
+        "ct": devices.CurrentTransducerDevice,
     }
 
     def __init__(self, config_file):

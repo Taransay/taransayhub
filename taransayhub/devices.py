@@ -444,3 +444,112 @@ class TemperatureHumidityDevice(Device):
         }
 
         await self.publish(self.state_topic, payload=json.dumps(payload))
+
+
+class CurrentTransducerDevice(Device):
+    def __init__(self, *, channels, expire_after=60, rssi=False, rssi_description=None, **kwargs):
+        self.channels = dict(channels)
+        self.expire_after = int(expire_after)
+        self.rssi = rssi
+        self.rssi_description = rssi_description
+        self.__config_topics = []
+        super().__init__(**kwargs)
+
+    def mqtt_filter(self):
+        return self.filter(self.command_topic)
+
+    async def mqtt_subscribe(self):
+        await self.subscribe(self.command_topic)
+
+    @property
+    def state_topic(self):
+        pieces = [self.discovery_prefix, self.unique_id, "state"]
+        return "/".join(pieces)
+
+    @property
+    def command_topic(self):
+        pieces = [self.discovery_prefix, self.unique_id, "set"]
+        return "/".join(pieces)
+
+    async def mqtt_publish_discovery(self):
+        sensor_config = []
+        topic_pieces = [self.discovery_prefix, "sensor"]
+
+        channels = dict(self.channels)
+
+        if self.rssi:
+            # Configure an RSSI channel.
+            channels["rssi"] = {
+                "enabled": True,
+                "description": self.rssi_description,
+                "class": "signal_strength",
+                "unit": "dBm",
+            }
+
+        for channel_name, channel_data in channels.items():
+            if not channel_data.get("enabled"):
+                LOGGER.info(f"skipping ignored channel {repr(channel_name)} for node {self.node}")
+                continue
+
+            channel_unique_id = f"{self.unique_id}-{channel_name}"
+            pieces = topic_pieces + [channel_unique_id, "config"]
+            config_topic = "/".join(pieces)
+            self.__config_topics.append(config_topic)
+
+            payload = json.dumps(
+                {
+                    "unique_id": channel_unique_id,
+                    "name": channel_data["description"],
+                    "device": self.device_spec,
+                    "device_class": channel_data["class"],
+                    "state_topic": self.state_topic,
+                    "unit_of_measurement": channel_data["unit"],
+                    "value_template": f"{{{{ value_json.data.{channel_name} }}}}",
+                    "expire_after": self.expire_after,
+                }
+            )
+
+            await self.publish(config_topic, payload=payload, retain=True)
+
+    async def mqtt_unconfigure(self, client):
+        await self.unsubscribe(self.command_topic)
+        await self.publish(self.state_topic, payload="")
+
+        for config_topic in self.__config_topics:
+            await self.publish(config_topic, payload="")
+
+    async def handle_filtered_messages(self, messages):
+        async for message in messages:
+            state = message.payload.decode()
+            LOGGER.debug(f"mqtt payload: {repr(state)}")
+            # Do nothing.
+            LOGGER.debug("(doing nothing)")
+
+    async def handle_device_payload(self, payload):
+        message = payload["msg"]
+        rssi = payload.get("rssi")
+        pieces = message.split(":")
+        payload = {}
+
+        invalid_msg = f"Invalid payload for message received to {self}: {repr(message)}"
+
+        # Should be STATE:V:<VOLTAGE>:P:<POWER>:T1:<TEMPERATURE>:T2:<EXTERNAL_TEMPERATURE>:H:<HUMIDITY>
+        if pieces[0] != "STATE" or len(pieces) != 11:
+            LOGGER.error(invalid_msg)
+            return
+
+        def prepare(raw, channel):
+            scale = float(self.channels[channel]["scale"])
+            precision = self.channels[channel]["precision"]
+            return f"{float(raw) * scale:.{precision}f}"
+
+        payload["data"] = {
+            "battery_voltage": prepare(pieces[2], "battery_voltage"),
+            "power": prepare(pieces[4], "power"),
+            "temperature": prepare(pieces[6], "temperature"),
+            "ext_temperature": prepare(pieces[8], "ext_temperature"),
+            "humidity": prepare(pieces[10], "humidity"),
+            "rssi": rssi
+        }
+
+        await self.publish(self.state_topic, payload=json.dumps(payload))

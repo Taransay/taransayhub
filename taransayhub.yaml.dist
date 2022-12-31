@@ -14,6 +14,54 @@ nodes:
     firmware: taransay_x
     firmware_version: "1.0.0"
 
+  10:
+    name: ct1
+    description: House electricity sensor
+    device_type: ct
+    board: Taransay
+    board_version: r1
+    firmware: taransay_ct
+    firmware_version: "1.2.0"
+    expire_after: 60
+    rssi: true
+    rssi_description: House electricity received signal strength indicator
+    channels:
+      battery_voltage:
+        enabled: true
+        description: House electricity battery voltage
+        unit: V
+        class: voltage
+        scale: 0.001
+        precision: 3
+      power:
+        enabled: true
+        description: House electricity power
+        unit: W
+        class: power
+        scale: 1.0
+        precision: 0
+      temperature:
+        enabled: true
+        description: House electricity temperature
+        unit: °C
+        class: temperature
+        scale: 0.01
+        precision: 2
+      ext_temperature:
+        enabled: true
+        description: House electricity external temperature
+        unit: °C
+        class: temperature
+        scale: 0.1
+        precision: 1
+      humidity:
+        enabled: true
+        description: House electricity humidity
+        unit: "%"
+        class: humidity
+        scale: 0.01
+        precision: 2
+
   25:
     name: th1
     description: Living room environment sensor
