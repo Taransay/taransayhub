@@ -157,6 +157,7 @@ class TaransayHub:
                 msg = raw_msg.strip().decode()
             except UnicodeDecodeError as e:
                 LOGGER.error(f"Error decoding message: {e}")
+                LOGGER.debug(f"original message: {repr(raw_msg.strip())})")
             else:
                 await self._handle_received_serial(msg)
 
