@@ -48,6 +48,7 @@ class TaransayHub:
         self.baud_rate = None
         self.nodes = None
         self.discovery_prefix = None
+        self.mqtt_host = None
         self.client_id = None
         self.request_acknowledge = None
 
@@ -66,6 +67,7 @@ class TaransayHub:
         with self._config_file.open("r") as fobj:
             config_data = yaml.safe_load(fobj)
 
+        self.mqtt_host = config_data["mqtt_host"]
         self.client_id = config_data["client_id"]
         self.request_acknowledge = config_data["request_acknowledge"]
         self.device_path = Path(config_data["device_path"])
@@ -89,7 +91,7 @@ class TaransayHub:
         self._configure_devices()
 
         # Connect to the MQTT broker
-        self._client = Client("localhost", client_id=self.client_id)
+        self._client = Client(self.mqtt_host, client_id=self.client_id)
 
         async with AsyncExitStack() as stack:
             await stack.enter_async_context(self._client)

@@ -1,3 +1,4 @@
+mqtt_host: some-host
 client_id: some-host
 request_acknowledge: true
 device_path: /dev/ttyS0
